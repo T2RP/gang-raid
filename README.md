@@ -197,4 +197,4 @@ Pull requests are welcome. For major changes please open an issue first to discu
 
 ---
 
-*Built for the FiveM roleplay community by Decripterr.*
+*Built for the FiveM roleplay community by Zix.*
