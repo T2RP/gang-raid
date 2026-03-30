@@ -65,6 +65,7 @@ local raidCooldownEnd = 0
 local activeLocation  = nil
 local raidStarterSrc  = nil
 local guardNetIds     = {}
+local crateNetId      = nil   -- net ID of the single networked crate
 
 -- =============================================
 -- FRAMEWORK INIT
@@ -197,19 +198,17 @@ local function EndRaid()
     raidActive     = false
     activeLocation = nil
     raidStarterSrc = nil
-    -- Keep guardNetIds alive so cleanupPeds can use them after the loot window
 
-    -- Phase 1: tell all clients the raid is won so they can claim bonus and get notified
     TriggerClientEvent('gang_hideout:raidWon', -1)
 
     if Config.Debug then
         print('[gang-raid] Raid won — loot window open for ' .. Config.LootWindowDuration .. 's')
     end
 
-    -- Phase 2: after loot window, clean up all remaining entities
     SetTimeout(Config.LootWindowDuration * 1000, function()
         TriggerClientEvent('gang_hideout:raidFinished', -1, guardNetIds)
         guardNetIds = {}
+        crateNetId  = nil
     end)
 end
 
@@ -233,6 +232,7 @@ RegisterNetEvent('gang_hideout:startRaid', function()
     raidActive      = true
     raidCooldownEnd = now + Config.RaidCooldown
     guardNetIds     = {}
+    crateNetId      = nil
     raidStarterSrc  = src
 
     local locationIndex = math.random(1, #Config.Locations)
@@ -245,7 +245,8 @@ RegisterNetEvent('gang_hideout:startRaid', function()
     TriggerClientEvent('gang_hideout:raidStarted', -1, locationIndex)
 
     SetTimeout(800, function()
-        TriggerClientEvent('gang_hideout:spawnGuards', src, activeLocation.guards)
+        -- Pass both the guards list and the single crate coord to the spawner
+        TriggerClientEvent('gang_hideout:spawnGuards', src, activeLocation.guards, activeLocation.crateCoord)
     end)
 
     SetTimeout(3000, function()
@@ -262,6 +263,18 @@ RegisterNetEvent('gang_hideout:guardsSpawned', function(netIds)
         print('[gang-raid] ' .. #netIds .. ' guards spawned.')
     end
     TriggerClientEvent('gang_hideout:configurePeds', -1, netIds)
+end)
+
+-- Spawner reports the crate net ID — broadcast to all other clients
+RegisterNetEvent('gang_hideout:crateSpawned', function(netId)
+    local src = source
+    if src ~= raidStarterSrc then return end
+    crateNetId = netId
+    if Config.Debug then
+        print('[gang-raid] Crate net ID received: ' .. netId)
+    end
+    -- Tell every client EXCEPT the spawner (who already has the target attached)
+    TriggerClientEvent('gang_hideout:configureCrate', -1, netId)
 end)
 
 -- Spawner client reports all guards are dead → begin loot window then cleanup
