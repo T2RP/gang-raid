@@ -1,18 +1,9 @@
 -- =============================================
--- GANG HIDEOUT RAID | server.lua  v5.0
+-- GANG HIDEOUT RAID | server.lua  v6.1
 -- =============================================
 
 -- =============================================
 -- VERSION CHECKER
--- Compares local version (fxmanifest.lua) against
--- the latest published GitHub Release tag.
---
--- REQUIREMENTS:
---   1. Your repo must have at least one published
---      Release on GitHub (not just a tag).
---   2. FiveM must be able to reach api.github.com.
---      If you use a firewall/txAdmin, ensure outbound
---      HTTPS is not blocked for server resources.
 -- =============================================
 local GITHUB_REPO     = 'zixja/gang-raid'
 local RESOURCE_NAME   = GetCurrentResourceName()
@@ -20,71 +11,60 @@ local CURRENT_VERSION = GetResourceMetadata(RESOURCE_NAME, 'version', 0) or '1.0
 
 local function CheckVersion()
     local url = 'https://api.github.com/repos/' .. GITHUB_REPO .. '/releases/latest'
-
     print('^5[gang-raid] Checking for updates... (current: v' .. CURRENT_VERSION .. ')^7')
 
     PerformHttpRequest(url, function(statusCode, response, headers)
-
-        -- No response at all — likely a firewall/network block
         if not response or response == '' then
-            print('^3[gang-raid] Version check got no response. Is api.github.com reachable from your server?^7')
+            print('^3[gang-raid] Version check got no response.^7')
             return
         end
-
-        -- 404 = repo exists but has no published Releases yet
         if statusCode == 404 then
-            print('^3[gang-raid] Version check: no releases found at github.com/' .. GITHUB_REPO .. '. Publish a Release on GitHub to enable update checking.^7')
+            print('^3[gang-raid] Version check: no releases found at github.com/' .. GITHUB_REPO .. '^7')
             return
         end
-
         if statusCode ~= 200 then
             print('^3[gang-raid] Version check failed — HTTP ' .. tostring(statusCode) .. '^7')
             return
         end
-
-        -- Pull tag_name out of JSON — handles "v1.0.0" and "1.0.0"
         local latestTag = response:match('"tag_name"%s*:%s*"([^"]+)"')
         if not latestTag then
             print('^3[gang-raid] Version check: could not parse tag from GitHub response.^7')
             return
         end
-
         local latest  = latestTag:gsub('^[vV]', '')
         local current = CURRENT_VERSION:gsub('^[vV]', '')
-
         if current == latest then
-            print('^2[gang-raid] ✓ Up to date (v' .. current .. ')^7')
+            print('^2[gang-raid] Up to date (v' .. current .. ')^7')
         else
             print(' ')
-            print('^1[ GANG RAID ] ═══════════════════════════════════^7')
+            print('^1[ GANG RAID ] ══════════════════════════════════^7')
             print('^1  UPDATE AVAILABLE!^7')
             print('^3  Running  : ^7v' .. current)
             print('^2  Latest   : ^7v' .. latest)
             print('^5  Download : ^7https://github.com/' .. GITHUB_REPO .. '/releases/latest')
-            print('^1═══════════════════════════════════════════════^7')
+            print('^1═════════════════════════════════════════════════^7')
             print(' ')
         end
-
     end, 'GET', '', {
         ['User-Agent'] = 'FiveM/' .. RESOURCE_NAME .. '-version-check',
         ['Accept']     = 'application/vnd.github+json',
     })
 end
 
--- Delay startup check so the server networking stack is fully ready
 CreateThread(function()
     Wait(5000)
     CheckVersion()
 end)
 
-local QBCore             = nil
-local raidActive         = false
-local raidCooldownEnd    = 0
-local currentWave        = 0
-local activeLocation     = nil
-local waveMonitorRunning = false
-local raidStarterSrc     = nil
-local waveNetIds         = {}
+-- =============================================
+-- STATE
+-- =============================================
+local QBCore          = nil
+local raidActive      = false
+local raidCooldownEnd = 0
+local activeLocation  = nil
+local raidStarterSrc  = nil
+local guardNetIds     = {}
 
 -- =============================================
 -- FRAMEWORK INIT
@@ -182,8 +162,7 @@ local function SendDispatch(src, coords)
 end
 
 -- =============================================
--- SHARED LOOT ROLL
--- Used by both crate looting and guard looting.
+-- LOOT ROLL
 -- =============================================
 local function RollLoot(src)
     local shuffled = {}
@@ -192,7 +171,6 @@ local function RollLoot(src)
         local j = math.random(i)
         shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
     end
-
     for _, item in ipairs(shuffled) do
         if math.random(100) <= item.chance then
             local amount = math.random(item.amount.min, item.amount.max)
@@ -207,86 +185,31 @@ local function RollLoot(src)
 end
 
 -- =============================================
--- WAVE MONITOR
+-- END RAID
+-- FIX: Previously called CleanupRaid with a 2s
+-- delay, deleting guards/crates before players
+-- could loot them. Now we split into two phases:
+--   Phase 1 (raidWon)     — instant, claims bonus
+--   Phase 2 (raidFinished)— after LootWindowDuration,
+--                           actually deletes entities
 -- =============================================
-local function StartWaveMonitor()
-    if waveMonitorRunning then return end
-    waveMonitorRunning = true
+local function EndRaid()
+    raidActive     = false
+    activeLocation = nil
+    raidStarterSrc = nil
+    -- Keep guardNetIds alive so cleanupPeds can use them after the loot window
 
-    CreateThread(function()
-        Wait(10000)
+    -- Phase 1: tell all clients the raid is won so they can claim bonus and get notified
+    TriggerClientEvent('gang_hideout:raidWon', -1)
 
-        while raidActive do
-            Wait(5000)
+    if Config.Debug then
+        print('[gang-raid] Raid won — loot window open for ' .. Config.LootWindowDuration .. 's')
+    end
 
-            if #waveNetIds == 0 then goto continue end
-
-            local aliveCount = 0
-            local toDelete   = {}
-
-            for _, netId in ipairs(waveNetIds) do
-                if NetworkDoesEntityExistWithNetworkId(netId) then
-                    local ped = NetworkGetEntityFromNetworkId(netId)
-                    if DoesEntityExist(ped) then
-                        if IsEntityDead(ped) then
-                            table.insert(toDelete, ped)
-                        else
-                            aliveCount = aliveCount + 1
-                        end
-                    end
-                end
-            end
-
-            -- Tell all clients to delete these dead peds locally
-            -- Server-side DeleteEntity is unreliable for client-spawned networked peds
-            local deadNetIds = {}
-            for _, deadPed in ipairs(toDelete) do
-                local netId = NetworkGetNetworkIdFromEntity(deadPed)
-                if netId and netId ~= 0 then
-                    table.insert(deadNetIds, netId)
-                end
-            end
-            if #deadNetIds > 0 then
-                -- Small delay so players have time to loot before peds disappear
-                SetTimeout(30000, function()
-                    TriggerClientEvent('gang_hideout:cleanupPeds', -1, deadNetIds)
-                end)
-            end
-
-            if aliveCount == 0 then
-                waveNetIds  = {}
-                currentWave = currentWave + 1
-
-                if currentWave > Config.MaxWaves then
-                    raidActive         = false
-                    waveMonitorRunning = false
-                    -- Small delay before raidFinished so loot monitor has time
-                    -- to register the last kill before cleanup wipes the ped list
-                    SetTimeout(2000, function()
-                        TriggerClientEvent('gang_hideout:raidFinished', -1)
-                    end)
-                    if Config.Debug then print('[gang-raid] Raid complete.') end
-                    return
-                else
-                    NotifyAll('Wave ' .. currentWave .. ' incoming in ' .. Config.WaveDelay .. 's!', 'error')
-                    Wait(Config.WaveDelay * 1000)
-
-                    if raidStarterSrc then
-                        TriggerClientEvent('gang_hideout:spawnWave', raidStarterSrc,
-                            activeLocation.waves[currentWave], currentWave)
-
-                        if currentWave == Config.MaxWaves then
-                            TriggerClientEvent('gang_hideout:spawnEscapeVehicle', raidStarterSrc,
-                                activeLocation.escapeVehicle)
-                        end
-                    end
-                end
-            end
-
-            ::continue::
-        end
-
-        waveMonitorRunning = false
+    -- Phase 2: after loot window, clean up all remaining entities
+    SetTimeout(Config.LootWindowDuration * 1000, function()
+        TriggerClientEvent('gang_hideout:raidFinished', -1, guardNetIds)
+        guardNetIds = {}
     end)
 end
 
@@ -309,8 +232,7 @@ RegisterNetEvent('gang_hideout:startRaid', function()
 
     raidActive      = true
     raidCooldownEnd = now + Config.RaidCooldown
-    currentWave     = 1
-    waveNetIds      = {}
+    guardNetIds     = {}
     raidStarterSrc  = src
 
     local locationIndex = math.random(1, #Config.Locations)
@@ -323,8 +245,7 @@ RegisterNetEvent('gang_hideout:startRaid', function()
     TriggerClientEvent('gang_hideout:raidStarted', -1, locationIndex)
 
     SetTimeout(800, function()
-        TriggerClientEvent('gang_hideout:spawnWave', src,
-            activeLocation.waves[currentWave], currentWave)
+        TriggerClientEvent('gang_hideout:spawnGuards', src, activeLocation.guards)
     end)
 
     SetTimeout(3000, function()
@@ -332,24 +253,23 @@ RegisterNetEvent('gang_hideout:startRaid', function()
     end)
 end)
 
-RegisterNetEvent('gang_hideout:waveSpawned', function(netIds)
+-- Spawner reports back all guard net IDs
+RegisterNetEvent('gang_hideout:guardsSpawned', function(netIds)
     local src = source
     if src ~= raidStarterSrc then return end
-    waveNetIds = netIds
+    guardNetIds = netIds
     if Config.Debug then
-        print('[gang-raid] Wave ' .. currentWave .. ' has ' .. #netIds .. ' peds.')
+        print('[gang-raid] ' .. #netIds .. ' guards spawned.')
     end
     TriggerClientEvent('gang_hideout:configurePeds', -1, netIds)
-    StartWaveMonitor()
 end)
 
-RegisterNetEvent('gang_hideout:escapeVehicleSpawned', function(driverNetId)
-    TriggerClientEvent('gang_hideout:driveEscapeVehicle', -1,
-        driverNetId,
-        activeLocation.blip.coords.x,
-        activeLocation.blip.coords.y,
-        activeLocation.blip.coords.z)
-    NotifyAll('Enemy reinforcements are inbound!', 'error')
+-- Spawner client reports all guards are dead → begin loot window then cleanup
+RegisterNetEvent('gang_hideout:waveClear', function()
+    local src = source
+    if src ~= raidStarterSrc then return end
+    if not raidActive then return end
+    EndRaid()
 end)
 
 -- Crate loot
@@ -357,27 +277,22 @@ RegisterNetEvent('gang_hideout:giveLoot', function()
     local src    = source
     local Player = GetPlayer(src)
     if not Player and Config.InventoryExport ~= 'ox_inventory' then return end
-
     if not RollLoot(src) then
         NotifyClient(src, 'The crate was empty.', 'error')
     end
 end)
 
 -- Guard body loot
--- Guards carry less than crates on average since they're an extra reward.
--- Rolls from the same loot table but with a reduced chance per item.
 RegisterNetEvent('gang_hideout:lootGuard', function()
     local src    = source
     local Player = GetPlayer(src)
     if not Player and Config.InventoryExport ~= 'ox_inventory' then return end
 
-    -- Guards have a 50% chance of carrying anything at all
     if math.random(100) > 50 then
         NotifyClient(src, 'Nothing of value on the body.', 'error')
         return
     end
 
-    -- Use a reduced loot table (half the chance values)
     local shuffled = {}
     for _, v in ipairs(Config.LootTable) do
         shuffled[#shuffled + 1] = {
@@ -409,10 +324,10 @@ RegisterNetEvent('gang_hideout:lootGuard', function()
     end
 end)
 
--- Completion bonus
+-- Completion bonus — FIX: now triggered by raidWon on the client, not raidFinished,
+-- so it fires when guards die rather than when entities are deleted.
 RegisterNetEvent('gang_hideout:claimBonus', function()
-    local src = source
-    if raidActive then return end
+    local src    = source
     local Player = GetPlayer(src)
     if not Player then return end
 
