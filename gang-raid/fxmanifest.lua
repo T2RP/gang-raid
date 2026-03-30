@@ -4,7 +4,7 @@ lua54 'yes'
 
 description 'Gang Hideout Raid - QBCore/QBox/OX'
 author      'Zix'
-version     '1.0.0'
+version     'v6.1'
 
 shared_script 'config.lua'
 
