@@ -43,12 +43,8 @@ Config.Locations = {
             scale  = 0.9,
             label  = "Gang Hideout",
         },
-        lootCrates = {
-            vector3(-613.25, -1624.78, 33.01),
-            vector3(-605.89, -1633.7,  33.05),
-            vector3(-596.6,  -1619.59, 33.01),
-            vector3(-589.16, -1618.51, 33.01),
-        },
+        -- Single networked crate that guards protect — all players see the same object
+        crateCoord = vector3(-611.13, -1604.73, 25.75),
         guards = {
             { coords = vector4(-611.49, -1614.83, 27.01, 347.29), model = 'g_m_y_ballasout_01', weapon = 'WEAPON_ASSAULTRIFLE',  armor = 100, accuracy = 70 },
             { coords = vector4(-599.62, -1587.85, 26.75, 119.01), model = 'g_m_y_ballasout_01', weapon = 'WEAPON_CARBINERIFLE',  armor = 100, accuracy = 70 },
