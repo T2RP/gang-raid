@@ -1,5 +1,5 @@
 -- =============================================
--- GANG HIDEOUT RAID | client.lua  v6.0
+-- GANG HIDEOUT RAID | client.lua  v6.1
 -- Supports: qb-target / ox_target (auto-detect)
 --           QBCore / QBox / ox_lib notify
 -- =============================================
@@ -10,10 +10,14 @@ local spawnedCrates      = {}   -- object handles so we can delete on cleanup
 local spawnedGuards      = {}   -- { ped = handle, looted = bool }
 local lootedGuards       = {}   -- [ped handle] = true
 local activeLocation     = nil
--- no blip — waypoint used instead
 local lootMonitorRunning = false
 local aiLoopRunning      = false
-local isRaidStarter      = false  -- true only on the client who triggered the raid
+local isRaidStarter      = false
+local raidClearReported  = false
+local seenAlive          = false
+-- FIX: track whether the loot window is open so raidFinished
+-- doesn't delete bodies players are actively looting mid-animation
+local lootWindowOpen     = false
 
 -- Init QBCore if available
 local ok, obj = pcall(function() return exports['qb-core']:GetCoreObject() end)
@@ -94,29 +98,15 @@ end
 -- EMOTE HELPER
 -- =============================================
 local function PlayEmote(scenario)
-    local playerPed = PlayerPedId()
     if scenario then
-        TaskStartScenarioInPlace(playerPed, scenario, 0, true)
+        TaskStartScenarioInPlace(PlayerPedId(), scenario, 0, true)
     else
-        -- ClearPedTasksImmediately forcefully exits any active scenario
-        -- ClearPedTasks alone queues the stop but the scenario can persist
         ClearPedTasksImmediately(PlayerPedId())
     end
 end
 
 -- =============================================
 -- OX_LIB SKILLCHECK + PROGRESSBAR LOOT SEQUENCE
---
--- Flow:
---   1. Skillcheck pops (must pass to continue)
---   2. Emote starts
---   3. Progress bar runs — player can press E/Backspace to cancel
---   4. Emote always cleared on exit regardless of outcome
---
--- NOTE: We do NOT pass anim.scenario to the progressBar.
--- Letting ox_lib manage the animation internally conflicts
--- with our manual scenario task and prevents clean cancellation.
--- The scenario is started before the bar and cleared after.
 -- =============================================
 local function DoLootSequence(params)
     local hasOxLib = GetResourceState('ox_lib') == 'started'
@@ -126,7 +116,6 @@ local function DoLootSequence(params)
         return
     end
 
-    -- 1. Skillcheck first (no emote yet — looks weird to animate before passing)
     local passed = exports['ox_lib']:skillCheck({ 'easy', 'medium' }, { 'e' })
 
     if not passed then
@@ -135,10 +124,8 @@ local function DoLootSequence(params)
         return
     end
 
-    -- 2. Start emote AFTER passing skillcheck
     PlayEmote(params.emote)
 
-    -- 3. Progress bar — NO anim block so ox_lib doesn't fight our scenario
     local completed = exports['ox_lib']:progressBar({
         duration     = params.duration or 4000,
         label        = params.progressLabel or 'Searching...',
@@ -152,7 +139,6 @@ local function DoLootSequence(params)
         },
     })
 
-    -- 4. Always clear emote immediately when bar finishes or is cancelled
     ClearPedTasksImmediately(PlayerPedId())
 
     if completed then
@@ -251,7 +237,6 @@ local function StartGuardAILoop()
     CreateThread(function()
         while aiLoopRunning do
             Wait(1500)
-
             for _, entry in ipairs(spawnedGuards) do
                 local ped = entry.ped
                 if not DoesEntityExist(ped) or IsEntityDead(ped) then goto continue end
@@ -265,23 +250,22 @@ local function StartGuardAILoop()
 end
 
 -- =============================================
--- GUARD MONITOR
--- Runs on the spawner client only.
--- Every second checks all guards in the current wave:
---   - If newly dead → add Search Body loot target
---   - If ALL dead   → report gang_hideout:waveClear
---     to server so it can advance to the next wave
+-- LOOT MONITOR
+-- Runs only on the raid-starter client.
+-- Watches for dead guards, adds loot targets to
+-- bodies, and signals the server when all are down.
 --
--- The server cannot reliably detect entity death for
--- client-spawned peds, so the client is authoritative.
+-- FIX: Previously reported waveClear the moment
+-- deadCount >= totalGuards which could fire before
+-- seenAlive was set (i.e. on the very first tick
+-- if guards hadn't registered yet). Now we gate on
+-- seenAlive being true, meaning at least one guard
+-- was confirmed alive before we start counting deaths.
 -- =============================================
-local waveClearReported  = false
-local seenAlive          = false
-
 local function StartLootMonitor()
     if lootMonitorRunning then return end
     lootMonitorRunning = true
-    waveClearReported  = false
+    raidClearReported  = false
     seenAlive          = false
 
     CreateThread(function()
@@ -297,18 +281,23 @@ local function StartLootMonitor()
                 local ped = entry.ped
 
                 if not DoesEntityExist(ped) then
-                    -- Ped was deleted externally, count as dead
                     deadCount = deadCount + 1
                 elseif IsEntityDead(ped) then
                     deadCount = deadCount + 1
 
-                    -- Add loot target once per guard
+                    -- FIX: Only add target if the ped still exists at the time the
+                    -- timeout fires. Previously we checked DoesEntityExist inside
+                    -- the timeout but the entity could be deleted by CleanupRaid
+                    -- (which ran after 2s) before the 1.5s timeout even elapsed,
+                    -- meaning the target was added to a deleted ped and vanished.
+                    -- Now CleanupRaid is deferred by LootWindowDuration so bodies
+                    -- persist long enough for players to actually interact.
                     if not entry.looted and not lootedGuards[ped] then
                         lootedGuards[ped] = true
                         entry.looted      = true
 
-                        local p     = ped
-                        local e     = entry
+                        local p = ped
+                        local e = entry
                         SetTimeout(1500, function()
                             if not DoesEntityExist(p) then return end
                             AddEntityTarget(p, "Search Body", "fas fa-search", 1.5, function(entity)
@@ -321,6 +310,7 @@ local function StartLootMonitor()
                                         TriggerServerEvent("gang_hideout:lootGuard")
                                     end,
                                     onFail = function()
+                                        -- Let the player retry on failure
                                         if DoesEntityExist(p) then
                                             lootedGuards[p] = nil
                                             e.looted        = false
@@ -330,23 +320,28 @@ local function StartLootMonitor()
                             end)
                         end)
                     end
+                else
+                    -- Guard is alive — mark that we've seen at least one alive guard
+                    -- so we don't trigger waveClear prematurely on the first tick
+                    seenAlive = true
                 end
             end
 
-            -- All guards dead — only the spawner client reports this.
-            -- seenAlive gate: we must observe at least one living guard
-            -- before we can declare the wave clear. This prevents a false
-            -- clear on the very first tick before peds have fully spawned.
-            if deadCount < totalGuards then
-                seenAlive = true
-            end
-
-            if isRaidStarter and seenAlive and deadCount >= totalGuards and totalGuards > 0 and not waveClearReported then
-                waveClearReported = true
+            -- All guards confirmed dead and we previously saw them alive
+            if isRaidStarter
+            and seenAlive
+            and deadCount >= totalGuards
+            and totalGuards > 0
+            and not raidClearReported then
+                raidClearReported = true
+                lootWindowOpen    = true
                 if Config.Debug then
-                    print('[gang-raid] Wave cleared — ' .. totalGuards .. ' guards down')
+                    print('[gang-raid] All guards cleared — ' .. totalGuards .. ' down')
                 end
                 TriggerServerEvent('gang_hideout:waveClear')
+
+                -- Stop AI loop — no live guards left to command
+                aiLoopRunning = false
             end
 
             ::continue::
@@ -356,8 +351,6 @@ end
 
 -- =============================================
 -- WAYPOINT HELPERS
--- Sets a GPS waypoint to the raid location.
--- Cleared when the raid ends.
 -- =============================================
 local function SetRaidWaypoint(coords)
     SetNewWaypoint(coords.x, coords.y)
@@ -368,282 +361,18 @@ local function ClearRaidBlip()
 end
 
 -- =============================================
--- RAID STARTED — fires on ALL clients
--- =============================================
-RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
-    lootedCrates       = {}
-    spawnedCrates      = {}
-    lootedGuards       = {}
-    spawnedGuards      = {}
-    lootMonitorRunning = false
-    aiLoopRunning      = false
-    isRaidStarter      = false
-    activeLocation     = Config.Locations[locationIndex]
-
-    SetRaidWaypoint(activeLocation.blip.coords)
-
-    for i, coords in pairs(activeLocation.lootCrates) do
-        local crateId = "crate_" .. i
-        -- Spawn slightly above ground so PlaceObjectOnGroundProperly
-        -- has room to raycast downward and find the surface.
-        -- We unfreeze briefly, place, wait for physics to settle,
-        -- then refreeze so the crate sits flush on the ground.
-        local obj = CreateObject(GetHashKey('ch_prop_ch_crate_01a'), coords.x, coords.y, coords.z + 2.0, true, true, true)
-        SetEntityAsMissionEntity(obj, true, true)
-
-        -- Let physics run for a tick so the engine registers the object
-        FreezeEntityPosition(obj, false)
-        Wait(50)
-        PlaceObjectOnGroundProperly(obj)
-        Wait(200)  -- wait for the prop to settle onto the surface
-        FreezeEntityPosition(obj, true)
-
-        table.insert(spawnedCrates, obj)  -- track for cleanup on raid end
-
-        AddEntityTarget(obj, "Search Crate", "fas fa-box-open", 2.0, function(entity)
-            if lootedCrates[crateId] then
-                Notify("This crate is already empty.", "error")
-                return
-            end
-
-            DoLootSequence({
-                emote         = 'PROP_HUMAN_BUM_BIN',   -- rummaging through a container
-                progressLabel = 'Searching crate...',
-                duration      = 6000,
-                onSuccess     = function()
-                    lootedCrates[crateId] = true
-                    TriggerServerEvent("gang_hideout:giveLoot")
-                    RemoveEntityTarget(entity)
-                    DeleteEntity(entity)
-                end,
-                -- onFail: do nothing, player can try again
-            })
-        end)
-    end
-
-    if Config.Debug then print('[gang-raid] Raid started at: ' .. activeLocation.name) end
-end)
-
--- =============================================
--- SPAWN WAVE — raid-starter client only
--- =============================================
-RegisterNetEvent('gang_hideout:spawnWave', function(guards, waveNum)
-    isRaidStarter      = true
-    local groupHash    = SetupGuardRelationships()
-    spawnedGuards      = {}
-    waveClearReported  = false
-    lootMonitorRunning = false  -- kill any running monitor so this wave gets a fresh one
-    aiLoopRunning      = false  -- same for AI loop
-    local netIds       = {}
-
-    -- ── Step 1: Pre-load all unique models before spawning any peds.
-    -- Requesting them all upfront fills the streaming budget once
-    -- rather than hammering it one-by-one inside the spawn loop.
-    local uniqueModels = {}
-    for _, guard in pairs(guards) do
-        local hash = GetHashKey(guard.model)
-        if not uniqueModels[hash] then
-            uniqueModels[hash] = true
-            RequestModel(hash)
-        end
-    end
-    -- Wait until every model is loaded before proceeding
-    local allLoaded = false
-    local loadTimeout = 0
-    while not allLoaded and loadTimeout < 10000 do
-        allLoaded = true
-        for hash, _ in pairs(uniqueModels) do
-            if not HasModelLoaded(hash) then
-                allLoaded = false
-                break
-            end
-        end
-        if not allLoaded then
-            Wait(100)
-            loadTimeout = loadTimeout + 100
-        end
-    end
-
-    -- ── Step 2: Spawn peds one at a time.
-    -- For each ped we:
-    --   a) Force it visible immediately with SetEntityVisible
-    --   b) Set a very high LOD distance so it never culls out
-    --   c) Wait up to 1s for the model to actually render
-    --      before spawning the next one
-    -- This is the only reliable way to prevent invisible peds
-    -- when spawning many NPCs in a small area simultaneously.
-    for _, guard in pairs(guards) do
-        local model = GetHashKey(guard.model)
-
-        local ped = CreatePed(4, model,
-            guard.coords.x, guard.coords.y, guard.coords.z, guard.coords.w,
-            true, true)
-
-        SetEntityAsMissionEntity(ped, true, true)
-        NetworkRegisterEntityAsNetworked(ped)
-
-        -- Force visibility — prevents streaming culling from hiding the ped
-        SetEntityVisible(ped, true, false)
-        SetEntityLodDist(ped, 500)          -- never cull beyond 500 units
-        SetPedConfigFlag(ped, 320, true)    -- disable ambient occlusion culling
-
-        GiveWeaponToPed(ped, GetHashKey(guard.weapon), 200, true, true)
-        SetPedArmour(ped, guard.armor    or 100)
-        SetPedAccuracy(ped, guard.accuracy or 70)
-
-        ApplyCombatSettings(ped, groupHash)
-        TaskGuardCombat(ped)
-
-        table.insert(spawnedGuards, { ped = ped, looted = false })
-
-        -- Wait for valid network ID
-        local timeout = 0
-        while (not NetworkGetNetworkIdFromEntity(ped) or NetworkGetNetworkIdFromEntity(ped) == 0) do
-            Wait(50)
-            timeout = timeout + 50
-            if timeout > 3000 then break end
-        end
-
-        local netId = NetworkGetNetworkIdFromEntity(ped)
-        if netId and netId ~= 0 then
-            table.insert(netIds, netId)
-        end
-
-        -- Wait for the ped to be fully rendered before spawning the next.
-        -- IsEntityVisible returns true once the model is actually drawn.
-        -- Cap at 1000ms so a bad ped doesn't stall the whole wave.
-        local renderWait = 0
-        while not IsEntityVisible(ped) and renderWait < 1000 do
-            Wait(50)
-            renderWait = renderWait + 50
-        end
-
-        -- Extra gap so the streaming budget isn't overwhelmed
-        Wait(200)
-    end
-
-    -- Release model refs now that all peds are created
-    for hash, _ in pairs(uniqueModels) do
-        SetModelAsNoLongerNeeded(hash)
-    end
-
-    TriggerServerEvent('gang_hideout:waveSpawned', netIds)
-    StartLootMonitor()
-    StartGuardAILoop()
-    Notify('Wave ' .. waveNum .. ' — enemies inbound!', 'error')
-
-    if Config.Debug then print('[gang-raid] Wave ' .. waveNum .. ' spawned ' .. #netIds .. ' peds.') end
-end)
-
--- =============================================
--- CONFIGURE PEDS — ALL clients
--- =============================================
-RegisterNetEvent('gang_hideout:configurePeds', function(netIds)
-    Wait(800)
-    local groupHash = SetupGuardRelationships()
-
-    for _, netId in ipairs(netIds) do
-        if NetworkDoesEntityExistWithNetworkId(netId) then
-            local ped = NetworkGetEntityFromNetworkId(netId)
-            if DoesEntityExist(ped) and not IsPedAPlayer(ped) then
-                -- Force visibility on all clients, not just spawner
-                SetEntityVisible(ped, true, false)
-                SetEntityLodDist(ped, 500)
-                SetPedConfigFlag(ped, 320, true)
-
-                ApplyCombatSettings(ped, groupHash)
-
-                local alreadyTracked = false
-                for _, entry in ipairs(spawnedGuards) do
-                    if entry.ped == ped then alreadyTracked = true break end
-                end
-                if not alreadyTracked then
-                    table.insert(spawnedGuards, { ped = ped, looted = false })
-                end
-            end
-        end
-    end
-
-    -- Note: StartLootMonitor is intentionally NOT called here.
-    -- Only the spawner client runs the monitor (via spawnWave).
-    -- Non-spawner clients just apply combat settings and track peds for AI.
-end)
-
--- =============================================
--- SPAWN ESCAPE VEHICLE — raid-starter client only
--- =============================================
-RegisterNetEvent('gang_hideout:spawnEscapeVehicle', function(vehicleData)
-    if not Config.EscapeVehicleEnabled then return end
-
-    local model = GetHashKey(vehicleData.model)
-    RequestModel(model)
-    while not HasModelLoaded(model) do Wait(0) end
-
-    local veh = CreateVehicle(model,
-        vehicleData.coords.x, vehicleData.coords.y,
-        vehicleData.coords.z, vehicleData.coords.w,
-        true, true)
-    SetEntityAsMissionEntity(veh, true, true)
-    NetworkRegisterEntityAsNetworked(veh)
-    SetModelAsNoLongerNeeded(model)
-
-    local driverModelName = (activeLocation
-        and activeLocation.waves
-        and activeLocation.waves[1]
-        and activeLocation.waves[1][1]
-        and activeLocation.waves[1][1].model)
-        or 'g_m_y_ballasout_01'
-
-    local driverModel = GetHashKey(driverModelName)
-    RequestModel(driverModel)
-    while not HasModelLoaded(driverModel) do Wait(0) end
-
-    local driver = CreatePedInsideVehicle(veh, 4, driverModel, -1, true, true)
-    SetEntityAsMissionEntity(driver, true, true)
-    NetworkRegisterEntityAsNetworked(driver)
-    GiveWeaponToPed(driver, GetHashKey('WEAPON_ASSAULTRIFLE'), 200, true, true)
-    SetPedArmour(driver, 200)
-
-    local timeout = 0
-    while (not NetworkGetNetworkIdFromEntity(driver) or NetworkGetNetworkIdFromEntity(driver) == 0) do
-        Wait(50)
-        timeout = timeout + 50
-        if timeout > 3000 then break end
-    end
-
-    local driverNetId = NetworkGetNetworkIdFromEntity(driver)
-    SetModelAsNoLongerNeeded(driverModel)
-    TriggerServerEvent('gang_hideout:escapeVehicleSpawned', driverNetId)
-end)
-
--- =============================================
--- DRIVE ESCAPE VEHICLE — all clients
--- =============================================
-RegisterNetEvent('gang_hideout:driveEscapeVehicle', function(driverNetId, x, y, z)
-    Wait(500)
-    if not NetworkDoesEntityExistWithNetworkId(driverNetId) then return end
-    local driver = NetworkGetEntityFromNetworkId(driverNetId)
-    if not DoesEntityExist(driver) then return end
-    local veh = GetVehiclePedIsIn(driver, false)
-    if DoesEntityExist(veh) then
-        TaskVehicleDriveToCoordLongrange(driver, veh, x, y, z, 30.0, 786603, 20.0)
-    end
-end)
-
--- =============================================
--- RAID FINISHED — all clients
--- =============================================
--- =============================================
 -- FULL RAID CLEANUP
--- Deletes all client-side entities (crates, guards)
--- and removes the blip. Called on raidFinished and
--- also exported so server can trigger it directly.
+-- FIX: Now only called after LootWindowDuration
+-- has elapsed (triggered by gang_hideout:raidFinished).
+-- Previously CleanupRaid fired 2s after waveClear,
+-- deleting all bodies and crates almost immediately.
 -- =============================================
 local function CleanupRaid()
     lootMonitorRunning = false
     aiLoopRunning      = false
+    lootWindowOpen     = false
 
-    -- Delete remaining crate props
+    -- Remove crate props
     for _, obj in ipairs(spawnedCrates) do
         if DoesEntityExist(obj) then
             RemoveEntityTarget(obj)
@@ -654,7 +383,7 @@ local function CleanupRaid()
     spawnedCrates = {}
     lootedCrates  = {}
 
-    -- Delete remaining guard peds
+    -- Remove guard peds
     for _, entry in ipairs(spawnedGuards) do
         local ped = entry.ped
         if DoesEntityExist(ped) then
@@ -666,34 +395,273 @@ local function CleanupRaid()
     spawnedGuards = {}
     lootedGuards  = {}
 
-    -- Clear GPS waypoint
     ClearRaidBlip()
-
     activeLocation = nil
 end
 
-RegisterNetEvent('gang_hideout:raidFinished', function()
-    CleanupRaid()
-    Notify('Gang hideout cleared! Check your inventory for your bonus.', 'success')
+-- =============================================
+-- NET EVENTS
+-- =============================================
+
+-- Fires on ALL clients when the raid location is chosen
+RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
+    -- Reset all state
+    lootedCrates       = {}
+    spawnedCrates      = {}
+    lootedGuards       = {}
+    spawnedGuards      = {}
+    lootMonitorRunning = false
+    aiLoopRunning      = false
+    isRaidStarter      = false
+    raidClearReported  = false
+    seenAlive          = false
+    lootWindowOpen     = false
+    activeLocation     = Config.Locations[locationIndex]
+
+    SetRaidWaypoint(activeLocation.blip.coords)
+
+    -- Spawn loot crates in a thread — Wait() calls are not safe in a bare net event
+    -- callback and CreateObject requires the model to be streamed first.
+    CreateThread(function()
+        -- Request and wait for the crate model to fully stream before spawning
+        local crateModel = GetHashKey('ch_prop_ch_crate_01a')
+        RequestModel(crateModel)
+        local modelTimeout = 0
+        while not HasModelLoaded(crateModel) and modelTimeout < 5000 do
+            Wait(100)
+            modelTimeout = modelTimeout + 100
+        end
+
+        if not HasModelLoaded(crateModel) then
+            print('^1[gang-raid] ERROR: Crate model failed to load — crates will not spawn.^7')
+            SetModelAsNoLongerNeeded(crateModel)
+            return
+        end
+
+        for i, coords in pairs(activeLocation.lootCrates) do
+            local crateId = "crate_" .. i
+
+            local obj = CreateObject(crateModel, coords.x, coords.y, coords.z + 2.0, true, true, true)
+
+            if not DoesEntityExist(obj) then
+                if Config.Debug then print('[gang-raid] Crate ' .. crateId .. ' failed to create.') end
+                goto nextcrate
+            end
+
+            SetEntityAsMissionEntity(obj, true, true)
+
+            -- Let physics settle so PlaceObjectOnGroundProperly has a surface to raycast
+            FreezeEntityPosition(obj, false)
+            Wait(100)
+            PlaceObjectOnGroundProperly(obj)
+            Wait(300)
+            FreezeEntityPosition(obj, true)
+
+            table.insert(spawnedCrates, obj)
+
+            AddEntityTarget(obj, "Search Crate", "fas fa-box-open", 2.0, function(entity)
+                if lootedCrates[crateId] then
+                    Notify("This crate is already empty.", "error")
+                    return
+                end
+
+                DoLootSequence({
+                    emote         = 'PROP_HUMAN_BUM_BIN',
+                    progressLabel = 'Searching crate...',
+                    duration      = 6000,
+                    onSuccess     = function()
+                        lootedCrates[crateId] = true
+                        TriggerServerEvent("gang_hideout:giveLoot")
+                        RemoveEntityTarget(entity)
+                    end,
+                    onFail = function()
+                        -- Player can retry on fail
+                    end,
+                })
+            end)
+
+            if Config.Debug then print('[gang-raid] Crate ' .. crateId .. ' spawned.') end
+            ::nextcrate::
+        end
+
+        SetModelAsNoLongerNeeded(crateModel)
+
+        if Config.Debug then
+            print('[gang-raid] ' .. #spawnedCrates .. ' crates spawned at: ' .. activeLocation.name)
+        end
+    end)
+end)
+
+-- Fires on the raid-starter client only — spawn guards
+RegisterNetEvent('gang_hideout:spawnGuards', function(guards)
+    isRaidStarter      = true
+    local groupHash    = SetupGuardRelationships()
+    spawnedGuards      = {}
+    raidClearReported  = false
+    lootMonitorRunning = false
+    aiLoopRunning      = false
+    local netIds       = {}
+
+    -- Pre-load all unique models
+    local uniqueModels = {}
+    for _, guard in pairs(guards) do
+        local hash = GetHashKey(guard.model)
+        if not uniqueModels[hash] then
+            uniqueModels[hash] = true
+            RequestModel(hash)
+        end
+    end
+
+    local loadTimeout = 0
+    local allLoaded   = false
+    while not allLoaded and loadTimeout < 10000 do
+        allLoaded = true
+        for hash in pairs(uniqueModels) do
+            if not HasModelLoaded(hash) then
+                allLoaded = false
+                break
+            end
+        end
+        if not allLoaded then
+            Wait(100)
+            loadTimeout = loadTimeout + 100
+        end
+    end
+
+    -- Spawn each guard
+    for _, guard in pairs(guards) do
+        local model = GetHashKey(guard.model)
+
+        local ped = CreatePed(4, model,
+            guard.coords.x, guard.coords.y, guard.coords.z, guard.coords.w,
+            true, true)
+
+        SetEntityAsMissionEntity(ped, true, true)
+        NetworkRegisterEntityAsNetworked(ped)
+        SetEntityVisible(ped, true, false)
+        SetEntityLodDist(ped, 500)
+        SetPedConfigFlag(ped, 320, true)
+
+        local pedNetId = NetworkGetNetworkIdFromEntity(ped)
+        if pedNetId and pedNetId ~= 0 then
+            SetNetworkIdExistsOnAllMachines(pedNetId, true)
+            NetworkSetNetworkIdDynamic(pedNetId, true)
+        end
+
+        GiveWeaponToPed(ped, GetHashKey(guard.weapon), 200, true, true)
+        SetPedArmour(ped, guard.armor    or 100)
+        SetPedAccuracy(ped, guard.accuracy or 70)
+
+        ApplyCombatSettings(ped, groupHash)
+        TaskGuardCombat(ped)
+
+        table.insert(spawnedGuards, { ped = ped, looted = false })
+
+        -- Wait for network ID to be valid
+        local timeout = 0
+        while (not NetworkGetNetworkIdFromEntity(ped) or NetworkGetNetworkIdFromEntity(ped) == 0) and timeout < 3000 do
+            Wait(50)
+            timeout = timeout + 50
+        end
+
+        local netId = NetworkGetNetworkIdFromEntity(ped)
+        if netId and netId ~= 0 then
+            table.insert(netIds, netId)
+        end
+
+        -- Wait for entity to be visible before spawning the next
+        local renderWait = 0
+        while not IsEntityVisible(ped) and renderWait < 1000 do
+            Wait(50)
+            renderWait = renderWait + 50
+        end
+
+        Wait(200)
+    end
+
+    for hash in pairs(uniqueModels) do
+        SetModelAsNoLongerNeeded(hash)
+    end
+
+    TriggerServerEvent('gang_hideout:guardsSpawned', netIds)
+    StartLootMonitor()
+    StartGuardAILoop()
+    Notify('Gang hideout spotted — enemies on site!', 'error')
+
+    if Config.Debug then print('[gang-raid] Spawned ' .. #netIds .. ' guards.') end
+end)
+
+-- Fires on ALL clients — configure peds that the spawner created
+RegisterNetEvent('gang_hideout:configurePeds', function(netIds)
+    -- Give the spawner client time to fully register each entity on the network
+    Wait(1500)
+    local groupHash = SetupGuardRelationships()
+
+    for _, netId in ipairs(netIds) do
+        local waitTime = 0
+        while not NetworkDoesEntityExistWithNetworkId(netId) and waitTime < 3000 do
+            Wait(100)
+            waitTime = waitTime + 100
+        end
+
+        if NetworkDoesEntityExistWithNetworkId(netId) then
+            local ped = NetworkGetEntityFromNetworkId(netId)
+            if DoesEntityExist(ped) and not IsPedAPlayer(ped) then
+                SetEntityVisible(ped, true, false)
+                SetEntityLodDist(ped, 500)
+                SetPedConfigFlag(ped, 320, true)
+                ApplyCombatSettings(ped, groupHash)
+
+                -- Track on non-spawner clients so the AI loop works for everyone
+                local alreadyTracked = false
+                for _, entry in ipairs(spawnedGuards) do
+                    if entry.ped == ped then alreadyTracked = true; break end
+                end
+                if not alreadyTracked then
+                    table.insert(spawnedGuards, { ped = ped, looted = false })
+                end
+            end
+        end
+    end
+end)
+
+-- =============================================
+-- RAID WON — fires immediately when all guards die
+-- FIX: Previously claimBonus was called inside
+-- raidFinished which only fired after CleanupRaid,
+-- meaning the bonus triggered at the same moment
+-- everything was deleted. Now it fires here so the
+-- bonus is given while bodies are still lootable.
+-- =============================================
+RegisterNetEvent('gang_hideout:raidWon', function()
+    lootWindowOpen = true
+    Notify('All guards down! Loot the site — you have ' .. Config.LootWindowDuration .. ' seconds!', 'success')
     TriggerServerEvent('gang_hideout:claimBonus')
 end)
 
 -- =============================================
--- CLEANUP DEAD PEDS — all clients
--- Called 30s after each wave is cleared so
--- corpses don't litter the area forever.
+-- RAID FINISHED — fires after LootWindowDuration
+-- FIX: This is now the ONLY place CleanupRaid is
+-- called. It receives the guard netIds from the
+-- server for any remaining corpse cleanup.
 -- =============================================
-RegisterNetEvent('gang_hideout:cleanupPeds', function(netIds)
-    for _, netId in ipairs(netIds) do
-        if NetworkDoesEntityExistWithNetworkId(netId) then
-            local ped = NetworkGetEntityFromNetworkId(netId)
-            if DoesEntityExist(ped) and not IsPedAPlayer(ped) then
-                RemoveEntityTarget(ped)
-                SetEntityAsMissionEntity(ped, false, true)
-                DeleteEntity(ped)
+RegisterNetEvent('gang_hideout:raidFinished', function(netIds)
+    -- Clean up any leftover corpses passed by the server
+    if netIds then
+        for _, netId in ipairs(netIds) do
+            if NetworkDoesEntityExistWithNetworkId(netId) then
+                local ped = NetworkGetEntityFromNetworkId(netId)
+                if DoesEntityExist(ped) and not IsPedAPlayer(ped) then
+                    RemoveEntityTarget(ped)
+                    SetEntityAsMissionEntity(ped, false, true)
+                    DeleteEntity(ped)
+                end
             end
         end
     end
+
+    CleanupRaid()
+    Notify('The raid site has gone cold.', 'primary')
 end)
 
 -- =============================================
