@@ -1,22 +1,21 @@
 -- =============================================
--- GANG HIDEOUT RAID | client.lua  v6.1
+-- GANG HIDEOUT RAID | client.lua  v6.2
 -- Supports: qb-target / ox_target (auto-detect)
 --           QBCore / QBox / ox_lib notify
 -- =============================================
 
 local QBCore             = nil
-local lootedCrates       = {}
-local spawnedCrates      = {}   -- object handles so we can delete on cleanup
-local spawnedGuards      = {}   -- { ped = handle, looted = bool }
-local lootedGuards       = {}   -- [ped handle] = true
+local lootedCrate        = false         -- single crate, single flag
+local spawnedCrateHandle = nil           -- local entity handle of the networked crate
+local spawnedCrateNetId  = nil           -- net ID so all clients can resolve it
+local spawnedGuards      = {}            -- { ped = handle, looted = bool }
+local lootedGuards       = {}            -- [ped handle] = true
 local activeLocation     = nil
 local lootMonitorRunning = false
 local aiLoopRunning      = false
 local isRaidStarter      = false
 local raidClearReported  = false
 local seenAlive          = false
--- FIX: track whether the loot window is open so raidFinished
--- doesn't delete bodies players are actively looting mid-animation
 local lootWindowOpen     = false
 
 -- Init QBCore if available
@@ -194,6 +193,8 @@ end
 
 -- =============================================
 -- GUARD AI LOOP
+-- Guards defend the crate when idle; attack
+-- players when one comes close enough.
 -- =============================================
 local function RequestPedControl(ped)
     if NetworkHasControlOfEntity(ped) then return true end
@@ -226,7 +227,12 @@ local function TaskGuardCombat(ped)
     if closestPlayer then
         TaskCombatPed(ped, closestPlayer, 0, 16)
     else
-        TaskCombatHatedTargetsAroundPed(ped, 80.0, 0)
+        -- No player in range — guard defends the crate if it exists, otherwise patrols
+        if spawnedCrateHandle and DoesEntityExist(spawnedCrateHandle) then
+            TaskGuardCurrentPosition(ped)
+        else
+            TaskCombatHatedTargetsAroundPed(ped, 80.0, 0)
+        end
     end
 end
 
@@ -250,17 +256,7 @@ local function StartGuardAILoop()
 end
 
 -- =============================================
--- LOOT MONITOR
--- Runs only on the raid-starter client.
--- Watches for dead guards, adds loot targets to
--- bodies, and signals the server when all are down.
---
--- FIX: Previously reported waveClear the moment
--- deadCount >= totalGuards which could fire before
--- seenAlive was set (i.e. on the very first tick
--- if guards hadn't registered yet). Now we gate on
--- seenAlive being true, meaning at least one guard
--- was confirmed alive before we start counting deaths.
+-- LOOT MONITOR — raid-starter client only
 -- =============================================
 local function StartLootMonitor()
     if lootMonitorRunning then return end
@@ -285,13 +281,6 @@ local function StartLootMonitor()
                 elseif IsEntityDead(ped) then
                     deadCount = deadCount + 1
 
-                    -- FIX: Only add target if the ped still exists at the time the
-                    -- timeout fires. Previously we checked DoesEntityExist inside
-                    -- the timeout but the entity could be deleted by CleanupRaid
-                    -- (which ran after 2s) before the 1.5s timeout even elapsed,
-                    -- meaning the target was added to a deleted ped and vanished.
-                    -- Now CleanupRaid is deferred by LootWindowDuration so bodies
-                    -- persist long enough for players to actually interact.
                     if not entry.looted and not lootedGuards[ped] then
                         lootedGuards[ped] = true
                         entry.looted      = true
@@ -310,7 +299,6 @@ local function StartLootMonitor()
                                         TriggerServerEvent("gang_hideout:lootGuard")
                                     end,
                                     onFail = function()
-                                        -- Let the player retry on failure
                                         if DoesEntityExist(p) then
                                             lootedGuards[p] = nil
                                             e.looted        = false
@@ -321,13 +309,10 @@ local function StartLootMonitor()
                         end)
                     end
                 else
-                    -- Guard is alive — mark that we've seen at least one alive guard
-                    -- so we don't trigger waveClear prematurely on the first tick
                     seenAlive = true
                 end
             end
 
-            -- All guards confirmed dead and we previously saw them alive
             if isRaidStarter
             and seenAlive
             and deadCount >= totalGuards
@@ -335,13 +320,11 @@ local function StartLootMonitor()
             and not raidClearReported then
                 raidClearReported = true
                 lootWindowOpen    = true
+                aiLoopRunning     = false
                 if Config.Debug then
                     print('[gang-raid] All guards cleared — ' .. totalGuards .. ' down')
                 end
                 TriggerServerEvent('gang_hideout:waveClear')
-
-                -- Stop AI loop — no live guards left to command
-                aiLoopRunning = false
             end
 
             ::continue::
@@ -361,29 +344,53 @@ local function ClearRaidBlip()
 end
 
 -- =============================================
+-- ATTACH CRATE TARGET — used by both spawner
+-- (after spawning) and all other clients (after
+-- configureCrate resolves the net ID to a handle)
+-- =============================================
+local function AttachCrateTarget(obj)
+    AddEntityTarget(obj, "Search Crate", "fas fa-box-open", 2.0, function(entity)
+        if lootedCrate then
+            Notify("This crate is already empty.", "error")
+            return
+        end
+
+        DoLootSequence({
+            emote         = 'PROP_HUMAN_BUM_BIN',
+            progressLabel = 'Searching crate...',
+            duration      = 6000,
+            onSuccess     = function()
+                lootedCrate = true
+                TriggerServerEvent("gang_hideout:giveLoot")
+                RemoveEntityTarget(entity)
+                Notify("Crate looted!", "success")
+            end,
+            onFail = function()
+                -- Player can retry
+            end,
+        })
+    end)
+end
+
+-- =============================================
 -- FULL RAID CLEANUP
--- FIX: Now only called after LootWindowDuration
--- has elapsed (triggered by gang_hideout:raidFinished).
--- Previously CleanupRaid fired 2s after waveClear,
--- deleting all bodies and crates almost immediately.
 -- =============================================
 local function CleanupRaid()
     lootMonitorRunning = false
     aiLoopRunning      = false
     lootWindowOpen     = false
 
-    -- Remove crate props
-    for _, obj in ipairs(spawnedCrates) do
-        if DoesEntityExist(obj) then
-            RemoveEntityTarget(obj)
-            SetEntityAsMissionEntity(obj, false, true)
-            DeleteObject(obj)
-        end
+    -- Delete networked crate
+    if spawnedCrateHandle and DoesEntityExist(spawnedCrateHandle) then
+        RemoveEntityTarget(spawnedCrateHandle)
+        SetEntityAsMissionEntity(spawnedCrateHandle, false, true)
+        DeleteObject(spawnedCrateHandle)
     end
-    spawnedCrates = {}
-    lootedCrates  = {}
+    spawnedCrateHandle = nil
+    spawnedCrateNetId  = nil
+    lootedCrate        = false
 
-    -- Remove guard peds
+    -- Delete guard peds
     for _, entry in ipairs(spawnedGuards) do
         local ped = entry.ped
         if DoesEntityExist(ped) then
@@ -405,9 +412,9 @@ end
 
 -- Fires on ALL clients when the raid location is chosen
 RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
-    -- Reset all state
-    lootedCrates       = {}
-    spawnedCrates      = {}
+    lootedCrate        = false
+    spawnedCrateHandle = nil
+    spawnedCrateNetId  = nil
     lootedGuards       = {}
     spawnedGuards      = {}
     lootMonitorRunning = false
@@ -420,80 +427,18 @@ RegisterNetEvent('gang_hideout:raidStarted', function(locationIndex)
 
     SetRaidWaypoint(activeLocation.blip.coords)
 
-    -- Spawn loot crates in a thread — Wait() calls are not safe in a bare net event
-    -- callback and CreateObject requires the model to be streamed first.
-    CreateThread(function()
-        -- Request and wait for the crate model to fully stream before spawning
-        local crateModel = GetHashKey('ch_prop_ch_crate_01a')
-        RequestModel(crateModel)
-        local modelTimeout = 0
-        while not HasModelLoaded(crateModel) and modelTimeout < 5000 do
-            Wait(100)
-            modelTimeout = modelTimeout + 100
-        end
-
-        if not HasModelLoaded(crateModel) then
-            print('^1[gang-raid] ERROR: Crate model failed to load — crates will not spawn.^7')
-            SetModelAsNoLongerNeeded(crateModel)
-            return
-        end
-
-        for i, coords in pairs(activeLocation.lootCrates) do
-            local crateId = "crate_" .. i
-
-            local obj = CreateObject(crateModel, coords.x, coords.y, coords.z + 2.0, true, true, true)
-
-            if not DoesEntityExist(obj) then
-                if Config.Debug then print('[gang-raid] Crate ' .. crateId .. ' failed to create.') end
-                goto nextcrate
-            end
-
-            SetEntityAsMissionEntity(obj, true, true)
-
-            -- Let physics settle so PlaceObjectOnGroundProperly has a surface to raycast
-            FreezeEntityPosition(obj, false)
-            Wait(100)
-            PlaceObjectOnGroundProperly(obj)
-            Wait(300)
-            FreezeEntityPosition(obj, true)
-
-            table.insert(spawnedCrates, obj)
-
-            AddEntityTarget(obj, "Search Crate", "fas fa-box-open", 2.0, function(entity)
-                if lootedCrates[crateId] then
-                    Notify("This crate is already empty.", "error")
-                    return
-                end
-
-                DoLootSequence({
-                    emote         = 'PROP_HUMAN_BUM_BIN',
-                    progressLabel = 'Searching crate...',
-                    duration      = 6000,
-                    onSuccess     = function()
-                        lootedCrates[crateId] = true
-                        TriggerServerEvent("gang_hideout:giveLoot")
-                        RemoveEntityTarget(entity)
-                    end,
-                    onFail = function()
-                        -- Player can retry on fail
-                    end,
-                })
-            end)
-
-            if Config.Debug then print('[gang-raid] Crate ' .. crateId .. ' spawned.') end
-            ::nextcrate::
-        end
-
-        SetModelAsNoLongerNeeded(crateModel)
-
-        if Config.Debug then
-            print('[gang-raid] ' .. #spawnedCrates .. ' crates spawned at: ' .. activeLocation.name)
-        end
-    end)
+    if Config.Debug then print('[gang-raid] Raid started at: ' .. activeLocation.name) end
 end)
 
--- Fires on the raid-starter client only — spawn guards
-RegisterNetEvent('gang_hideout:spawnGuards', function(guards)
+-- =============================================
+-- SPAWN GUARDS + CRATE — raid-starter client only
+-- The crate is spawned here as a networked object
+-- so every player sees the exact same prop.
+-- Its net ID is sent back to the server which
+-- broadcasts it via configureCrate so all other
+-- clients can resolve it and attach a loot target.
+-- =============================================
+RegisterNetEvent('gang_hideout:spawnGuards', function(guards, crateCoord)
     isRaidStarter      = true
     local groupHash    = SetupGuardRelationships()
     spawnedGuards      = {}
@@ -502,7 +447,72 @@ RegisterNetEvent('gang_hideout:spawnGuards', function(guards)
     aiLoopRunning      = false
     local netIds       = {}
 
-    -- Pre-load all unique models
+    -- ---- SPAWN CRATE FIRST (networked) ----
+    CreateThread(function()
+        local crateModel = GetHashKey('prop_mb_crate_01a_set')
+        RequestModel(crateModel)
+        local mt = 0
+        while not HasModelLoaded(crateModel) and mt < 5000 do
+            Wait(100)
+            mt = mt + 100
+        end
+
+        if not HasModelLoaded(crateModel) then
+            print('^1[gang-raid] ERROR: Crate model failed to load.^7')
+            SetModelAsNoLongerNeeded(crateModel)
+            return
+        end
+
+        -- isNetwork=true, isMissionEntity=true, isScriptHostObj=false
+        local obj = CreateObject(crateModel, crateCoord.x, crateCoord.y, crateCoord.z + 0.5, true, true, false)
+
+        if not DoesEntityExist(obj) then
+            print('^1[gang-raid] ERROR: Crate CreateObject returned invalid handle.^7')
+            SetModelAsNoLongerNeeded(crateModel)
+            return
+        end
+
+        SetModelAsNoLongerNeeded(crateModel)
+        SetEntityAsMissionEntity(obj, true, true)
+        NetworkRegisterEntityAsNetworked(obj)
+
+        -- Wait for a valid net ID
+        local timeout = 0
+        while (not NetworkGetNetworkIdFromEntity(obj) or NetworkGetNetworkIdFromEntity(obj) == 0) and timeout < 3000 do
+            Wait(50)
+            timeout = timeout + 50
+        end
+
+        local crateNetId = NetworkGetNetworkIdFromEntity(obj)
+        if not crateNetId or crateNetId == 0 then
+            print('^1[gang-raid] ERROR: Crate failed to get a network ID.^7')
+            return
+        end
+
+        SetNetworkIdExistsOnAllMachines(crateNetId, true)
+        NetworkSetNetworkIdDynamic(crateNetId, true)
+
+        -- Settle the prop onto the ground
+        FreezeEntityPosition(obj, false)
+        Wait(100)
+        PlaceObjectOnGroundProperly(obj)
+        Wait(300)
+        FreezeEntityPosition(obj, true)
+
+        spawnedCrateHandle = obj
+        spawnedCrateNetId  = crateNetId
+
+        -- Attach loot target on the spawner client
+        AttachCrateTarget(obj)
+
+        -- Tell server the crate net ID so it can broadcast to everyone else
+        TriggerServerEvent('gang_hideout:crateSpawned', crateNetId)
+
+        if Config.Debug then print('[gang-raid] Crate spawned — netId: ' .. crateNetId) end
+    end)
+
+    -- ---- SPAWN GUARDS ----
+    -- Pre-load all unique ped models
     local uniqueModels = {}
     for _, guard in pairs(guards) do
         local hash = GetHashKey(guard.model)
@@ -528,7 +538,6 @@ RegisterNetEvent('gang_hideout:spawnGuards', function(guards)
         end
     end
 
-    -- Spawn each guard
     for _, guard in pairs(guards) do
         local model = GetHashKey(guard.model)
 
@@ -557,7 +566,6 @@ RegisterNetEvent('gang_hideout:spawnGuards', function(guards)
 
         table.insert(spawnedGuards, { ped = ped, looted = false })
 
-        -- Wait for network ID to be valid
         local timeout = 0
         while (not NetworkGetNetworkIdFromEntity(ped) or NetworkGetNetworkIdFromEntity(ped) == 0) and timeout < 3000 do
             Wait(50)
@@ -569,7 +577,6 @@ RegisterNetEvent('gang_hideout:spawnGuards', function(guards)
             table.insert(netIds, netId)
         end
 
-        -- Wait for entity to be visible before spawning the next
         local renderWait = 0
         while not IsEntityVisible(ped) and renderWait < 1000 do
             Wait(50)
@@ -591,9 +598,10 @@ RegisterNetEvent('gang_hideout:spawnGuards', function(guards)
     if Config.Debug then print('[gang-raid] Spawned ' .. #netIds .. ' guards.') end
 end)
 
--- Fires on ALL clients — configure peds that the spawner created
+-- =============================================
+-- CONFIGURE PEDS — all clients (non-spawner)
+-- =============================================
 RegisterNetEvent('gang_hideout:configurePeds', function(netIds)
-    -- Give the spawner client time to fully register each entity on the network
     Wait(1500)
     local groupHash = SetupGuardRelationships()
 
@@ -612,7 +620,6 @@ RegisterNetEvent('gang_hideout:configurePeds', function(netIds)
                 SetPedConfigFlag(ped, 320, true)
                 ApplyCombatSettings(ped, groupHash)
 
-                -- Track on non-spawner clients so the AI loop works for everyone
                 local alreadyTracked = false
                 for _, entry in ipairs(spawnedGuards) do
                     if entry.ped == ped then alreadyTracked = true; break end
@@ -626,27 +633,53 @@ RegisterNetEvent('gang_hideout:configurePeds', function(netIds)
 end)
 
 -- =============================================
+-- CONFIGURE CRATE — all clients (non-spawner)
+-- Resolves the networked crate net ID to a local
+-- entity handle and attaches the loot target.
+-- =============================================
+RegisterNetEvent('gang_hideout:configureCrate', function(crateNetId)
+    -- Give the spawner time to fully register the object on the network
+    local waitTime = 0
+    while not NetworkDoesEntityExistWithNetworkId(crateNetId) and waitTime < 5000 do
+        Wait(100)
+        waitTime = waitTime + 100
+    end
+
+    if not NetworkDoesEntityExistWithNetworkId(crateNetId) then
+        print('^1[gang-raid] ERROR: Crate net ID ' .. crateNetId .. ' never appeared on this client.^7')
+        return
+    end
+
+    local obj = NetworkGetEntityFromNetworkId(crateNetId)
+    if not DoesEntityExist(obj) then
+        print('^1[gang-raid] ERROR: Crate entity invalid after resolving net ID.^7')
+        return
+    end
+
+    spawnedCrateHandle = obj
+    spawnedCrateNetId  = crateNetId
+
+    SetEntityVisible(obj, true, false)
+    SetEntityLodDist(obj, 500)
+
+    AttachCrateTarget(obj)
+
+    if Config.Debug then print('[gang-raid] Crate configured on non-spawner client — netId: ' .. crateNetId) end
+end)
+
+-- =============================================
 -- RAID WON — fires immediately when all guards die
--- FIX: Previously claimBonus was called inside
--- raidFinished which only fired after CleanupRaid,
--- meaning the bonus triggered at the same moment
--- everything was deleted. Now it fires here so the
--- bonus is given while bodies are still lootable.
 -- =============================================
 RegisterNetEvent('gang_hideout:raidWon', function()
     lootWindowOpen = true
-    Notify('All guards down! Loot the site — you have ' .. Config.LootWindowDuration .. ' seconds!', 'success')
+    Notify('All guards down! Loot the crate — you have ' .. Config.LootWindowDuration .. ' seconds!', 'success')
     TriggerServerEvent('gang_hideout:claimBonus')
 end)
 
 -- =============================================
 -- RAID FINISHED — fires after LootWindowDuration
--- FIX: This is now the ONLY place CleanupRaid is
--- called. It receives the guard netIds from the
--- server for any remaining corpse cleanup.
 -- =============================================
 RegisterNetEvent('gang_hideout:raidFinished', function(netIds)
-    -- Clean up any leftover corpses passed by the server
     if netIds then
         for _, netId in ipairs(netIds) do
             if NetworkDoesEntityExistWithNetworkId(netId) then
