@@ -2,7 +2,7 @@ fx_version 'cerulean'
 game 'gta5'
 lua54 'yes'
 
-description 'Gang Hideout Raid - QBCore/QBox/OX'
+description 'Gang Raid - QBCore/QBox/OX'
 author      'Zix'
 version     'v6.1'
 
