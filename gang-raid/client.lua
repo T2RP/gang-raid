@@ -1,5 +1,5 @@
 -- =============================================
--- GANG HIDEOUT RAID | client.lua  v6.2
+-- GANG HIDEOUT RAID | client.lua 
 -- Supports: qb-target / ox_target (auto-detect)
 --           QBCore / QBox / ox_lib notify
 -- =============================================
@@ -630,6 +630,9 @@ RegisterNetEvent('gang_hideout:configurePeds', function(netIds)
             end
         end
     end
+
+    -- Non-spawner clients also need to monitor guard deaths to attach loot targets
+    StartLootMonitor()
 end)
 
 -- =============================================
