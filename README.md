@@ -1,4 +1,4 @@
-# 🏚️ Gang Hideout Raid
+# 🏚️ Gang Raid
 **A fully synced, wave-based gang raid script for FiveM**
 
 [![FiveM](https://img.shields.io/badge/FiveM-Ready-brightgreen?style=flat-square)](https://fivem.net/)
