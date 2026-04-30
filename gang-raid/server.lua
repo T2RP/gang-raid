@@ -66,6 +66,9 @@ local activeLocation  = nil
 local raidStarterSrc  = nil
 local guardNetIds     = {}
 local crateNetId      = nil   -- net ID of the single networked crate
+local crateLooted     = false
+local lootWindowOpen  = false
+local bonusClaimed    = {}
 
 -- =============================================
 -- FRAMEWORK INIT
@@ -165,9 +168,24 @@ end
 -- =============================================
 -- LOOT ROLL
 -- =============================================
-local function RollLoot(src)
+local function RollCrateLoot(src)
+    -- CrateContents are guaranteed — every item is given with a random amount
+    local rewarded = false
+    for _, item in ipairs(Config.CrateContents) do
+        local amount = math.random(item.amount.min, item.amount.max)
+        if AddItem(src, item.name, amount) then
+            SendItemNotify(src, item.name, amount, 'add')
+            NotifyClient(src, 'Found ' .. amount .. 'x ' .. item.name, 'success')
+            rewarded = true
+        end
+    end
+    return rewarded
+end
+
+local function RollGuardLoot(src)
+    -- GuardLootTable is chance-based
     local shuffled = {}
-    for _, v in ipairs(Config.LootTable) do shuffled[#shuffled + 1] = v end
+    for _, v in ipairs(Config.GuardLootTable) do shuffled[#shuffled + 1] = v end
     for i = #shuffled, 2, -1 do
         local j = math.random(i)
         shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
@@ -198,6 +216,8 @@ local function EndRaid()
     raidActive     = false
     activeLocation = nil
     raidStarterSrc = nil
+    lootWindowOpen = true
+    bonusClaimed   = {}
 
     TriggerClientEvent('gang_hideout:raidWon', -1)
 
@@ -206,9 +226,12 @@ local function EndRaid()
     end
 
     SetTimeout(Config.LootWindowDuration * 1000, function()
+        lootWindowOpen = false
         TriggerClientEvent('gang_hideout:raidFinished', -1, guardNetIds)
         guardNetIds = {}
         crateNetId  = nil
+        crateLooted = false
+        bonusClaimed = {}
     end)
 end
 
@@ -233,6 +256,9 @@ RegisterNetEvent('gang_hideout:startRaid', function()
     raidCooldownEnd = now + Config.RaidCooldown
     guardNetIds     = {}
     crateNetId      = nil
+    crateLooted     = false
+    lootWindowOpen  = false
+    bonusClaimed    = {}
     raidStarterSrc  = src
 
     local locationIndex = math.random(1, #Config.Locations)
@@ -262,10 +288,16 @@ RegisterNetEvent('gang_hideout:guardsSpawned', function(netIds)
     if Config.Debug then
         print('[gang-raid] ' .. #netIds .. ' guards spawned.')
     end
-    TriggerClientEvent('gang_hideout:configurePeds', -1, netIds)
+    -- Send configurePeds to every client EXCEPT the spawner (who already has handles)
+    for _, playerId in ipairs(GetPlayers()) do
+        local pid = tonumber(playerId)
+        if pid ~= raidStarterSrc then
+            TriggerClientEvent('gang_hideout:configurePeds', pid, netIds)
+        end
+    end
 end)
 
--- Spawner reports the crate net ID — broadcast to all other clients
+-- Spawner reports the crate net ID — broadcast to all OTHER clients (not the spawner)
 RegisterNetEvent('gang_hideout:crateSpawned', function(netId)
     local src = source
     if src ~= raidStarterSrc then return end
@@ -274,7 +306,12 @@ RegisterNetEvent('gang_hideout:crateSpawned', function(netId)
         print('[gang-raid] Crate net ID received: ' .. netId)
     end
     -- Tell every client EXCEPT the spawner (who already has the target attached)
-    TriggerClientEvent('gang_hideout:configureCrate', -1, netId)
+    for _, playerId in ipairs(GetPlayers()) do
+        local pid = tonumber(playerId)
+        if pid ~= raidStarterSrc then
+            TriggerClientEvent('gang_hideout:configureCrate', pid, netId)
+        end
+    end
 end)
 
 -- Spawner client reports all guards are dead → begin loot window then cleanup
@@ -290,7 +327,12 @@ RegisterNetEvent('gang_hideout:giveLoot', function()
     local src    = source
     local Player = GetPlayer(src)
     if not Player and Config.InventoryExport ~= 'ox_inventory' then return end
-    if not RollLoot(src) then
+    if crateLooted then
+        NotifyClient(src, 'The crate was already looted.', 'error')
+        return
+    end
+    crateLooted = true
+    if not RollCrateLoot(src) then
         NotifyClient(src, 'The crate was empty.', 'error')
     end
 end)
@@ -306,33 +348,7 @@ RegisterNetEvent('gang_hideout:lootGuard', function()
         return
     end
 
-    local shuffled = {}
-    for _, v in ipairs(Config.LootTable) do
-        shuffled[#shuffled + 1] = {
-            name   = v.name,
-            amount = { min = v.amount.min, max = math.max(v.amount.min, math.floor(v.amount.max * 0.5)) },
-            chance = math.floor(v.chance * 0.5),
-        }
-    end
-    for i = #shuffled, 2, -1 do
-        local j = math.random(i)
-        shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-    end
-
-    local rewarded = false
-    for _, item in ipairs(shuffled) do
-        if math.random(100) <= item.chance then
-            local amount = math.random(item.amount.min, item.amount.max)
-            if AddItem(src, item.name, amount) then
-                SendItemNotify(src, item.name, amount, 'add')
-                NotifyClient(src, 'Found ' .. amount .. 'x ' .. item.name .. ' on the body.', 'success')
-                rewarded = true
-                break
-            end
-        end
-    end
-
-    if not rewarded then
+    if not RollGuardLoot(src) then
         NotifyClient(src, 'Nothing of value on the body.', 'error')
     end
 end)
@@ -343,10 +359,31 @@ RegisterNetEvent('gang_hideout:claimBonus', function()
     local src    = source
     local Player = GetPlayer(src)
     if not Player then return end
+    if not lootWindowOpen then return end
+    if bonusClaimed[src] then
+        NotifyClient(src, 'Bonus already claimed for this raid.', 'error')
+        return
+    end
+    bonusClaimed[src] = true
 
     local bonus = math.random(500, 1500)
     if AddItem(src, 'markedmoney', bonus) then
         SendItemNotify(src, 'markedmoney', bonus, 'add')
         NotifyClient(src, 'Raid bonus: $' .. bonus .. ' in marked bills!', 'success')
+    else
+        bonusClaimed[src] = nil
     end
 end)
+
+-- =============================================
+-- DEBUG COMMANDS
+-- =============================================
+RegisterCommand('gangraid_state', function(src)
+    if src ~= 0 then return end -- server console only
+
+    print(('[gang-raid] raidActive=%s lootWindowOpen=%s crateLooted=%s'):format(
+        tostring(raidActive),
+        tostring(lootWindowOpen),
+        tostring(crateLooted)
+    ))
+end, true)
