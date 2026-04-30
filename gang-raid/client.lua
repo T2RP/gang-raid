@@ -1,5 +1,5 @@
 -- =============================================
--- GANG HIDEOUT RAID | client.lua 
+-- GANG HIDEOUT RAID | client.lua  v6.2
 -- Supports: qb-target / ox_target (auto-detect)
 --           QBCore / QBox / ox_lib notify
 -- =============================================
